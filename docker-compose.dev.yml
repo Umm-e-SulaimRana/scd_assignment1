@@ -1,0 +1,85 @@
+# Local dev/test stack for Sulaim's half (backend + data + cache + AI).
+# This is scoped to what Part C/D/E/F need to run and be demoed in isolation.
+# It should be MERGED into the team's real compose.yaml (Eiman owns Part G,
+# which also adds the frontend service and the production compose file) --
+# the two network names (edge/internal) and volume names here match §3.2
+# exactly so that merge is a copy-paste, not a redesign.
+name: civicpulse-dev
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true   # no route to the outside world -- database & cache live here only
+
+volumes:
+  pgdata:
+  redisdata:
+  ollama_models:
+
+services:
+  database:
+    image: postgres:16.4-alpine
+    networks: [internal]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-civicpulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicpulse}
+      POSTGRES_DB: ${POSTGRES_DB:-civicpulse}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civicpulse}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  cache:
+    image: redis:7.4-alpine
+    networks: [internal]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    networks: [edge]
+    volumes:
+      - ollama_models:/root/.ollama
+    profiles: ["ollama"]   # only starts with: docker compose --profile ollama up
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    networks: [edge, internal]   # only service that bridges both -- see §3.2 / ADR 0003
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-civicpulse}:${POSTGRES_PASSWORD:-civicpulse}@database:5432/${POSTGRES_DB:-civicpulse}
+      REDIS_URL: redis://cache:6379/0
+      TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-simulated}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      OLLAMA_URL: http://ollama:11434
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app   # dev-only hot reload bind mount; must be absent in the prod compose file
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
