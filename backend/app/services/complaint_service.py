@@ -19,7 +19,7 @@ class ComplaintService:
         self.repo = repo
         self.triage_service = triage_service
 
-       async def create_complaint(self, payload: ComplaintCreate) -> Complaint:
+    async def create_complaint(self, payload: ComplaintCreate) -> Complaint:
         complaint_id = uuid.uuid4()
         result, triaged_by, latency_ms = await self.triage_service.triage(
             payload.text, payload.location, complaint_id

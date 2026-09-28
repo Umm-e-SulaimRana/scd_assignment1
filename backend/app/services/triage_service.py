@@ -78,7 +78,7 @@ class TriageService:
         assert last_exc is not None
         raise last_exc
 
-       async def triage(self, text: str, location: str, complaint_id=None) -> tuple[TriageResult, str, int]:
+    async def triage(self, text: str, location: str, complaint_id=None) -> tuple[TriageResult, str, int]:
         start = time.monotonic()
         await redis_client.incr("triage:cache:total")
 
@@ -95,7 +95,7 @@ class TriageService:
         try:
             result = await self._call_with_timeout_and_retry(text, location)
         except Exception as exc:
-                logger.warning(
+            logger.warning(
                 "triage_fallback",
                 extra={
                     "complaint_id": str(complaint_id),
