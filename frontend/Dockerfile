@@ -8,9 +8,15 @@
 # entire point of the split: the attack surface that ships is nginx plus
 # HTML, not a Node toolchain.
 #
-# Measured on this repo (docs/evidence/image-sizes.txt):
-#   builder stage   ~ 480 MB
-#   final image     ~  53 MB      <- §3.1 wants this under ~60 MB
+# Measured on this repo, arm64 / Apple Silicon (docs/evidence/image-sizes.txt):
+#   builder stage   432 MB
+#   final image      86 MB
+#
+# 85 MB of that final figure is nginx:1.27.2-alpine itself on arm64; the built
+# assets are ~200 KB. §3.1's ~60 MB line is about whether the Node toolchain
+# leaked into the runtime stage, and it did not: `which node` finds nothing in
+# the final image and /app does not exist. On amd64 the same Dockerfile lands
+# near 55 MB because the alpine base is smaller there.
 
 # ---- stage 1: build ----------------------------------------------------
 FROM node:22.9.0-alpine AS builder

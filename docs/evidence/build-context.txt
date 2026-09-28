@@ -1,0 +1,9 @@
+Docker build-context size, before and after .dockerignore -- 2026-09-28T18:15:32Z
+'before' is du -sk of the context directory; 'after' is the tar Docker would send.
+
+frontend    before:   127496 KB   after:      300 KB   reduction: 100%
+backend     before:      384 KB   after:      210 KB   reduction: 46%
+
+The frontend number is the interesting one: node_modules is ~130 MB and is
+excluded, so the daemon receives a few hundred KB instead. Every KB here is
+paid on every single build, including every CI run.

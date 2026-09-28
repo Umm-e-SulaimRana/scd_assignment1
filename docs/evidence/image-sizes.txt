@@ -1,0 +1,16 @@
+Multi-stage image sizes -- 2026-09-28T18:13:48Z
+
+civicpulse-backend:dev	345MB
+civicpulse-backend:final	345MB
+civicpulse-frontend:builder	432MB
+civicpulse-frontend:dev	86MB
+civicpulse-frontend:final	86MB
+
+Proof the Node toolchain did not survive into the final frontend image:
+$ docker run --rm --entrypoint sh civicpulse-frontend:final -c 'which node; ls /app 2>&1'
+  node: not present
+ls: /app: No such file or directory
+
+And that neither image runs as root:
+  civicpulse-frontend:final    runs as: nginx
+  civicpulse-backend:final     runs as: app
