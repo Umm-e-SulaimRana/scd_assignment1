@@ -184,7 +184,7 @@ jobs:
         run: docker load -i /tmp/images.tar
 
       - name: Trivy -- backend
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-backend:ci
           format: table
@@ -197,7 +197,7 @@ jobs:
           vuln-type: os,library
 
       - name: Trivy -- frontend
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-frontend:ci
           format: table
@@ -207,7 +207,7 @@ jobs:
           vuln-type: os,library
 
       - name: Trivy -- repository secrets and misconfiguration
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
