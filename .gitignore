@@ -1,4 +1,6 @@
 # secrets — never commit
+.coverage
+htmlcov/
 .env
 *.env
 !.env.example

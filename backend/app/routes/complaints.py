@@ -4,7 +4,7 @@ business logic delegates to services/; all SQL delegates to repositories/.
 """
 import uuid
 
-from fastapi import APIRouter, Depends, Request, Response, HTTPException, Query
+from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_session
@@ -26,14 +26,16 @@ def _client_ip(request: Request) -> str:
 async def create_complaint(
     payload: ComplaintCreate,
     request: Request,
-    response: Response,
     session: AsyncSession = Depends(get_session),
     triage_service=Depends(get_triage_service),
 ):
     rl = await check_rate_limit(_client_ip(request))
     if not rl.allowed:
-        response.headers["Retry-After"] = str(rl.retry_after)
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Slow down and try again shortly.")
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Slow down and try again shortly.",
+            headers={"Retry-After": str(rl.retry_after)},
+        )
 
     repo = ComplaintRepository(session)
     service = ComplaintService(repo, triage_service)
