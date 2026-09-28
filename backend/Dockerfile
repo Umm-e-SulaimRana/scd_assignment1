@@ -16,16 +16,28 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 RUN addgroup --system app && adduser --system --ingroup app app
-
-# Nothing is installed at runtime -- the app runs out of /opt/venv. But the
-# base image's own pip and setuptools are still present in the final layer,
-# and Trivy scans them: setuptools 70.3.0 is CVE-2025-47273 (path traversal
-# in PackageIndex) and pip 25.0.1 vendors msgpack 1.1.2 (GHSA-6v7p-g79w-8964).
-# Upgrade both, pinned, because an unpinned --upgrade makes the image
-# unreproducible and that is the property this whole pipeline is built on.
-RUN /usr/local/bin/python -m pip install --no-cache-dir --upgrade \
-      "pip==26.2.1" "setuptools==84.0.0"
 COPY --from=builder /opt/venv /opt/venv
+
+# Strip the package managers out of the runtime image. The app runs uvicorn
+# from /opt/venv and never installs anything, so pip and setuptools are dead
+# weight. They are also where the last two HIGH findings came from, and not
+# in the way it looked: pip ships _vendor/vendor.txt, a manifest listing what
+# it bundles, and Trivy reads it as an installed package list. It named
+# msgpack==1.1.2 (GHSA-6v7p-g79w-8964) and setuptools==70.3.0
+# (CVE-2025-47273) no matter what was really on disk, which is why upgrading
+# the real ones to 26.2.1 and 84.0.0 changed the report by nothing at all.
+# Deleting the code is the honest fix rather than an ignore rule, and a
+# runtime with no package manager also cannot be made to install anything by
+# a process that gets a foothold in it.
+RUN rm -rf /usr/local/lib/python3.12/site-packages/pip \
+           /usr/local/lib/python3.12/site-packages/pip-*.dist-info \
+           /usr/local/lib/python3.12/site-packages/setuptools \
+           /usr/local/lib/python3.12/site-packages/setuptools-*.dist-info \
+           /usr/local/lib/python3.12/site-packages/pkg_resources \
+           /opt/venv/lib/python3.12/site-packages/pip \
+           /opt/venv/lib/python3.12/site-packages/pip-*.dist-info \
+           /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12 \
+           /opt/venv/bin/pip /opt/venv/bin/pip3 /opt/venv/bin/pip3.12
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini .
