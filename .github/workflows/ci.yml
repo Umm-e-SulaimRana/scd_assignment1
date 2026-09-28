@@ -270,8 +270,14 @@ jobs:
       - name: Create .env from the committed example
         run: |
           cp .env.example .env
-          # Deterministic provider: no key, no network, no flake.
-          sed -i 's/^TRIAGE_PROVIDER=.*/TRIAGE_PROVIDER=simulated/' .env
+          # Deterministic provider, no key, no network, no flake -- but `rules`
+          # rather than `simulated`. Both are deterministic; the difference is
+          # that SimulatedTriage hashes the text to pick a category, so asserting
+          # a specific value against it tests nothing. RuleBasedTriage does real
+          # keyword matching, so "burst water main" must classify as water, and
+          # the assertion below is a genuine end-to-end check of the triage path.
+          # The unit suite still pins TRIAGE_PROVIDER=simulated (test-backend).
+          sed -i 's/^TRIAGE_PROVIDER=.*/TRIAGE_PROVIDER=rules/' .env
           sed -i 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-only-not-a-real-secret/' .env
 
       - name: docker compose up
