@@ -1,0 +1,27 @@
+# Non-secret configuration only. Anything here is readable by anyone with
+# `get configmap` -- the database password and the LLM key are in the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: civicpulse-config
+  namespace: civicpulse
+data:
+  # Service DNS, not localhost. In Kubernetes "localhost" means this pod's own
+  # network namespace, so a backend using it would be talking to itself. That
+  # is the -8 deduction in §5.3 and the single most common cause of a
+  # deployment that works in Compose and dies on a cluster.
+  REDIS_URL: "redis://redis.civicpulse.svc.cluster.local:6379/0"
+  TRIAGE_PROVIDER: "rules"
+  GROQ_MODEL: "llama-3.1-8b-instant"
+  RATE_LIMIT_PER_MINUTE: "20"
+  LOG_LEVEL: "INFO"
+  STATS_CACHE_TTL: "30"
+  TRIAGE_CACHE_TTL: "86400"
+  CORS_ALLOW_ORIGINS: "http://civicpulse.local"
+  POSTGRES_DB: "civicpulse"
+  POSTGRES_USER: "civicpulse"
+  # Read by the frontend pod: nginx envsubst target, plus the value written
+  # into /config.js at container start. Same image as Compose runs, different
+  # value -- that is the whole point of runtime config (ADR 0002).
+  BACKEND_ORIGIN: "http://backend.civicpulse.svc.cluster.local:8000"
+  API_BASE: "/api"
