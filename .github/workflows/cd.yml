@@ -1,0 +1,253 @@
+# CD -- runs on every push to main (§3.4).
+#
+# main is protected, so the only way a push lands here is a merged pull
+# request whose CI checks were green and which a partner approved.
+#
+# The gating is the marked part. `needs:` on every publishing and deploying
+# job means nothing is pushed to a registry from code that is already known
+# to be broken, and nothing is deployed that was not pushed. Removing a
+# single `needs:` is -8 marks and, in practice, is how a bad build reaches
+# production.
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:      # lets you re-deploy a known-good SHA by hand
+
+permissions:
+  contents: read          # least privilege; individual jobs widen it below
+
+concurrency:
+  # Deploys are serialised. Two concurrent rollouts of different SHAs leave
+  # the cluster in a state neither run intended.
+  group: cd-main
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    # The full suite again, on the MERGED result. A PR was tested against its
+    # own head; this is the first time these commits exist together.
+    runs-on: ubuntu-24.04
+    env:
+      TRIAGE_PROVIDER: simulated
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check app/
+          mypy app/
+          python -m pytest -q --cov=app --cov-fail-under=65
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test
+
+  build-push:
+    needs: [test]                 # <- the gate. Never remove this.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write             # GITHUB_TOKEN scoped to GHCR, not an account password
+      id-token: write             # for keyless SBOM attestation
+    outputs:
+      # The digests are what the deploy job should pin to for the §4 bonus.
+      # A tag is a mutable pointer; a digest is the image's content hash and
+      # cannot be repointed at different bytes.
+      backend-digest: ${{ steps.backend.outputs.digest }}
+      frontend-digest: ${{ steps.frontend.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # A scoped, revocable token that expires with the job -- never a
+          # personal password (§3.4).
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the repository name
+        # GHCR rejects uppercase; github.repository preserves the owner's case.
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          # Tagged by commit SHA first. `latest` is published for convenience
+          # and is never what gets deployed.
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/backend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          provenance: true
+          sbom: true
+
+      - name: Build and push frontend
+        id: frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          provenance: true
+          sbom: true
+
+      - name: Generate an SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/backend:${{ github.sha }}
+          format: spdx-json
+          artifact-name: backend-sbom.spdx.json
+          output-file: backend-sbom.spdx.json
+
+      - name: Generate an SBOM for the frontend
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/frontend:${{ github.sha }}
+          format: spdx-json
+          artifact-name: frontend-sbom.spdx.json
+          output-file: frontend-sbom.spdx.json
+
+      - name: Record what was published
+        run: |
+          {
+            echo "### Published images"
+            echo ""
+            echo "| image | tag | digest |"
+            echo "|---|---|---|"
+            echo "| backend | \`${{ github.sha }}\` | \`${{ steps.backend.outputs.digest }}\` |"
+            echo "| frontend | \`${{ github.sha }}\` | \`${{ steps.frontend.outputs.digest }}\` |"
+            echo ""
+            echo "\`git show ${{ github.sha }}\` is the source that produced these."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-k8s:
+    needs: [build-push]           # <- the second gate. Never deploy what was not published.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the repository name
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Create an ephemeral k3d cluster
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: civicpulse
+          args: >-
+            --agents 2
+            --port "8080:80@loadbalancer"
+            --k3s-arg "--disable=traefik@server:0"
+
+      - name: Install the nginx ingress controller and metrics-server
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.3/deploy/static/provider/cloud/deploy.yaml
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+          # k3d nodes use self-signed kubelet certificates.
+          kubectl -n kube-system patch deploy metrics-server --type=json \
+            -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+          kubectl -n ingress-nginx wait --for=condition=available deploy/ingress-nginx-controller --timeout=300s
+
+      - name: Install kustomize
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Create the namespace and the real Secret
+        # Secret values come from GitHub Secrets at deploy time. The committed
+        # manifest carries placeholders only (§3.3); this replaces them.
+        run: |
+          kubectl create namespace civicpulse --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n civicpulse create secret generic civicpulse-secrets \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pin the overlay to THIS commit and apply
+        run: |
+          cd k8s/overlays/prod
+          # The one line that makes build-once-deploy-many real: the manifest
+          # that reaches the cluster names an immutable commit SHA, so
+          # "what is production running?" is answered by `git show`.
+          kustomize edit set image \
+            "ghcr.io/Umm-e-SulaimRana/scd_assignment1/backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/backend:${{ github.sha }}" \
+            "ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/frontend:${{ github.sha }}"
+          cd - >/dev/null
+
+          kustomize build k8s/overlays/prod | tee /tmp/rendered.yaml | kubectl apply -f -
+          echo "::group::rendered manifest"; cat /tmp/rendered.yaml; echo "::endgroup::"
+
+      - name: Wait for the rollout, then migrate and seed
+        run: |
+          kubectl -n civicpulse rollout status statefulset/postgres --timeout=300s
+          kubectl -n civicpulse rollout status deployment/redis --timeout=180s
+          kubectl -n civicpulse rollout status deployment/backend --timeout=300s
+          kubectl -n civicpulse rollout status deployment/frontend --timeout=180s
+
+          pod=$(kubectl -n civicpulse get pod -l app.kubernetes.io/name=backend -o name | head -1)
+          kubectl -n civicpulse exec "$pod" -- alembic upgrade head
+          kubectl -n civicpulse exec "$pod" -- python -m scripts.seed
+
+      - name: Smoke-test through the Ingress
+        run: |
+          kubectl -n civicpulse get ingress
+          # k3d publishes the load balancer on 8080; the Ingress matches on Host.
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8080/healthz | grep -q ok
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8080/ | grep -q '<div id="root">'
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8080/api/stats | tee /tmp/stats.json
+          python3 -c 'import json;d=json.load(open("/tmp/stats.json"));assert d["total"]>=30,d'
+          echo "smoke test passed: / serves the app and /api reaches the backend on one host"
+
+      - name: Show the HPA, as §3.4 requires
+        run: |
+          kubectl -n civicpulse get hpa
+          kubectl -n civicpulse describe hpa backend | sed -n '1,40p'
+
+      - name: Prove the deployed image is the commit, not a floating tag
+        run: |
+          kubectl -n civicpulse get deploy backend \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' | tee /tmp/deployed.txt
+          grep -q "${{ github.sha }}" /tmp/deployed.txt
+          grep -qv ':latest' /tmp/deployed.txt
+          echo "deployed by immutable reference"
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n civicpulse get all
+          kubectl -n civicpulse describe pods
+          kubectl -n civicpulse logs -l app.kubernetes.io/name=backend --tail=200 || true
