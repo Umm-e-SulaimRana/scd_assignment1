@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/part-of: civicpulse
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101          # the `nginx` user baked into nginx:alpine
+        runAsGroup: 101
+        # Without this the emptyDir volumes are root-owned and the entrypoint,
+        # running as uid 101, cannot write /config.js into them.
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          # The same image bytes that Compose runs locally. Nothing about the
+          # environment was compiled in; BACKEND_ORIGIN and API_BASE below are
+          # read at container start (ADR 0002).
+          image: ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend:REPLACED_BY_KUSTOMIZE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: BACKEND_ORIGIN
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: BACKEND_ORIGIN } }
+            - name: API_BASE
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: API_BASE } }
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 15
+            periodSeconds: 2
+          livenessProbe:
+            # /healthz is a static nginx return 200. It says "this nginx is
+            # alive", and nothing else -- if it proxied to the backend, a
+            # backend outage would restart every frontend pod for no reason.
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem plus nginx means every path nginx writes
+            # to has to be an explicit emptyDir: its cache directories, its
+            # pid file, and the html directory the entrypoint writes
+            # /config.js into at start.
+            - { name: nginx-cache, mountPath: /var/cache/nginx }
+            - { name: nginx-run, mountPath: /var/run }
+            - { name: nginx-conf, mountPath: /etc/nginx/conf.d }
+            - { name: html, mountPath: /usr/share/nginx/html }
+      volumes:
+        - { name: nginx-cache, emptyDir: {} }
+        - { name: nginx-run, emptyDir: {} }
+        - { name: nginx-conf, emptyDir: {} }
+        - { name: html, emptyDir: {} }
+      initContainers:
+        # /usr/share/nginx/html is an emptyDir so the entrypoint can write
+        # /config.js into it; this copies the built assets out of the image
+        # into that volume first, otherwise the mount would hide them.
+        - name: copy-assets
+          image: ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend:REPLACED_BY_KUSTOMIZE
+          command: ["sh", "-c", "cp -a /usr/share/nginx/html/. /html/"]
+          volumeMounts:
+            - { name: html, mountPath: /html }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: civicpulse
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
