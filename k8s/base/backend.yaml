@@ -1,0 +1,157 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 is what makes the rollout zero-downtime: capacity
+      # never dips below the current replica count, so there is no window
+      # where fewer pods are serving than before the update started.
+      # maxSurge: 1 adds one new pod at a time rather than doubling the
+      # deployment's CPU footprint on a cluster that may not have the room.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: civicpulse
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
+    spec:
+      # Kubernetes sends SIGTERM and starts a countdown. uvicorn is launched
+      # with --timeout-graceful-shutdown 30 (backend/Dockerfile), so this has
+      # to exceed the preStop sleep plus that drain window or the kubelet
+      # SIGKILLs mid-request.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          image: ghcr.io/Umm-e-SulaimRana/scd_assignment1/backend:REPLACED_BY_KUSTOMIZE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              # Assembled from the ConfigMap and the Secret rather than stored
+              # whole, so the password is never in a ConfigMap and the host is
+              # never in a Secret.
+              value: >-
+                postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres.civicpulse.svc.cluster.local:5432/$(POSTGRES_DB)
+            - name: POSTGRES_USER
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER } }
+            - name: POSTGRES_DB
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD } }
+            - name: GROQ_API_KEY
+              valueFrom: { secretKeyRef: { name: civicpulse-secrets, key: GROQ_API_KEY } }
+          envFrom:
+            - configMapRef:
+                name: civicpulse-config
+          # --- the three probes, and why they differ (§3.3) ---
+          startupProbe:
+            # A slow start is not a failure. Until this passes, the liveness
+            # probe is not evaluated at all, so a cold boot behind a slow
+            # migration cannot produce a restart loop. 30 x 2s = 60s of grace.
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            # Restarts the pod. /health deliberately touches nothing external
+            # (backend/app/routes/health.py): if it queried Postgres, a slow
+            # database would restart every backend pod at once and turn a
+            # dependency problem into an outage.
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            # Removes the pod from the Service -- it does not restart it.
+            # /ready DOES check Postgres and Redis, so a pod that cannot serve
+            # stops receiving traffic and rejoins by itself when the
+            # dependency recovers.
+            httpGet: { path: /ready, port: 8000 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal and SIGTERM race each other: kube-proxy on
+                # every node has to observe the endpoint going away, and that
+                # propagation is not instant. Sleeping first means the pod is
+                # already out of rotation before uvicorn stops accepting, so
+                # no in-flight request is dropped during a rollout.
+                command: ["sh", "-c", "sleep 10"]
+          resources:
+            # Mandatory, and not for tidiness: the HPA computes utilisation as
+            # usage / request. With no request there is no denominator and the
+            # HPA reports <unknown>/60% forever.
+            # These numbers were a guess; VPA's measured recommendation and the
+            # revision that followed are in docs/evidence/vpa-recommendation.txt.
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: civicpulse
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend
+  namespace: civicpulse
+spec:
+  # Voluntary disruptions -- a node drain, a cluster upgrade -- must leave at
+  # least one backend pod serving. Without this, draining a two-node cluster
+  # can evict both replicas at once and take the API down during planned
+  # maintenance.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend

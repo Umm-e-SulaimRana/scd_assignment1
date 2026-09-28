@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: civicpulse-config
+  namespace: civicpulse
+data:
+  TRIAGE_PROVIDER: "simulated"   # deterministic, no key, no network
+  LOG_LEVEL: "DEBUG"
+  CORS_ALLOW_ORIGINS: "http://localhost:8080,http://civicpulse.local"
