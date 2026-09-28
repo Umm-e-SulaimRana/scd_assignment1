@@ -1,0 +1,33 @@
+# Production overlay.
+#
+# The images below carry no tag on purpose: CI sets it, by commit SHA, with
+#
+#   kustomize edit set image \
+#     ghcr.io/Umm-e-SulaimRana/scd_assignment1/backend=ghcr.io/$REPO/backend:$GITHUB_SHA \
+#     ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend=ghcr.io/$REPO/frontend:$GITHUB_SHA
+#
+# so nothing here ever says :latest. That single line is what makes
+# "what is production running?" answerable with `git show <sha>`
+# (§3.4 non-negotiables, ADR 0003).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: civicpulse
+
+resources:
+  - ../../base
+
+images:
+  - name: ghcr.io/Umm-e-SulaimRana/scd_assignment1/backend
+    newTag: SET_BY_CI_TO_COMMIT_SHA
+  - name: ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend
+    newTag: SET_BY_CI_TO_COMMIT_SHA
+
+replicas:
+  - name: backend
+    count: 2
+  - name: frontend
+    count: 2
+
+patches:
+  - path: patch-prod-config.yaml
