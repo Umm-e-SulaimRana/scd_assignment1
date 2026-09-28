@@ -39,6 +39,17 @@ RUN npm run build
 # ---- stage 2: serve ----------------------------------------------------
 FROM nginx:1.30.5-alpine AS runtime
 
+# Patch the OS packages sitting on top of the pinned base. Trivy flagged
+# libexpat 2.8.4-r0 (CVE-2026-93990, XML injection via malformed UTF-16),
+# fixed in 2.8.5-r0. Alpine has shipped the fix; the nginx image has not been
+# rebuilt with it yet, and base images are always rebuilt on a slower cadence
+# than CVEs land. The tag stays pinned -- this patches what is inside it.
+# The cost is that the image is no longer byte-identical when rebuilt from
+# the tag alone. That is acceptable here precisely because CD never redeploys
+# by tag: it builds once, records the digest, and deploys that SHA, so what
+# runs is identified by what was built and scanned rather than re-derived.
+RUN apk --no-cache upgrade
+
 # Config as a template: nginx:alpine's own entrypoint runs envsubst over
 # /etc/nginx/templates/*.template at start, so BACKEND_ORIGIN is resolved per
 # environment, not per build.
