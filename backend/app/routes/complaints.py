@@ -64,7 +64,15 @@ async def list_complaints(
     items, total = await repo.list(
         category=category, priority=priority, status=status, page=page, page_size=page_size
     )
-    return ComplaintList(items=items, total=total, page=page, page_size=page_size)
+    # Explicit ORM -> schema conversion. ComplaintOut has from_attributes=True so
+    # FastAPI would coerce these anyway, but doing it here makes the boundary
+    # visible and keeps the declared return type honest.
+    return ComplaintList(
+        items=[ComplaintOut.model_validate(c) for c in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.patch("/{complaint_id}/status", response_model=ComplaintOut)
