@@ -16,6 +16,15 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 RUN addgroup --system app && adduser --system --ingroup app app
+
+# Nothing is installed at runtime -- the app runs out of /opt/venv. But the
+# base image's own pip and setuptools are still present in the final layer,
+# and Trivy scans them: setuptools 70.3.0 is CVE-2025-47273 (path traversal
+# in PackageIndex) and pip 25.0.1 vendors msgpack 1.1.2 (GHSA-6v7p-g79w-8964).
+# Upgrade both, pinned, because an unpinned --upgrade makes the image
+# unreproducible and that is the property this whole pipeline is built on.
+RUN /usr/local/bin/python -m pip install --no-cache-dir --upgrade \
+      "pip==26.2.1" "setuptools==84.0.0"
 COPY --from=builder /opt/venv /opt/venv
 COPY app ./app
 COPY alembic ./alembic

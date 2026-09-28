@@ -12,7 +12,7 @@
 #   builder stage   432 MB
 #   final image      86 MB
 #
-# 85 MB of that final figure is nginx:1.27.2-alpine itself on arm64; the built
+# 85 MB of that final figure is nginx:1.30.5-alpine itself on arm64; the built
 # assets are ~200 KB. §3.1's ~60 MB line is about whether the Node toolchain
 # leaked into the runtime stage, and it did not: `which node` finds nothing in
 # the final image and /app does not exist. On amd64 the same Dockerfile lands
@@ -37,7 +37,7 @@ COPY src ./src
 RUN npm run build
 
 # ---- stage 2: serve ----------------------------------------------------
-FROM nginx:1.27.2-alpine AS runtime
+FROM nginx:1.30.5-alpine AS runtime
 
 # Config as a template: nginx:alpine's own entrypoint runs envsubst over
 # /etc/nginx/templates/*.template at start, so BACKEND_ORIGIN is resolved per
