@@ -1,0 +1,32 @@
+CivicPulse network segmentation check -- 2026-09-28T18:12:30Z
+Topology: frontend=[edge]  backend=[edge,internal]  database,cache=[internal, internal:true]
+
+--- frontend -> database (must be blocked)
+$ docker compose exec -T frontend sh -c nc -z -w 3 database 5432
+    nc: bad address 'database'
+    => blocked (expected blocked)  PASS
+
+--- frontend -> cache (must be blocked)
+$ docker compose exec -T frontend sh -c nc -z -w 3 cache 6379
+    nc: bad address 'cache'
+    => blocked (expected blocked)  PASS
+
+--- backend -> database (must work)
+$ docker compose exec -T backend python -c import socket;socket.create_connection(('database',5432),3)
+    => ok (expected ok)  PASS
+
+--- backend -> cache (must work)
+$ docker compose exec -T backend python -c import socket;socket.create_connection(('cache',6379),3)
+    => ok (expected ok)  PASS
+
+--- database -> internet (must be blocked by internal: true)
+$ docker compose exec -T database sh -c wget -q -T 4 -O /dev/null https://api.groq.com
+    wget: bad address 'api.groq.com'
+    => blocked (expected blocked)  PASS
+
+--- frontend -> backend (must work)
+$ docker compose exec -T frontend sh -c wget -q -T 4 -O /dev/null http://backend:8000/health
+    => ok (expected ok)  PASS
+
+==============================
+pass: 6   fail: 0
