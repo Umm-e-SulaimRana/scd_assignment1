@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage, pinned, non-root (§3.1).
+#
+# Stage 1 has Node, the TypeScript compiler, 300-odd MB of node_modules and
+# every test file. Stage 2 has nginx and a directory of static assets.
+# Nothing from stage 1 reaches the final image except dist/, which is the
+# entire point of the split: the attack surface that ships is nginx plus
+# HTML, not a Node toolchain.
+#
+# Measured on this repo (docs/evidence/image-sizes.txt):
+#   builder stage   ~ 480 MB
+#   final image     ~  53 MB      <- §3.1 wants this under ~60 MB
+
+# ---- stage 1: build ----------------------------------------------------
+FROM node:22.9.0-alpine AS builder
+
+WORKDIR /app
+
+# Manifests before source. This layer is cached until a dependency actually
+# changes, so editing a component does not re-run npm ci (§3.1 "cache-friendly
+# COPY order"). `npm ci` not `npm install`: it installs exactly the lockfile.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json tsconfig.node.json vite.config.ts index.html ./
+COPY src ./src
+
+# tsc --noEmit runs first: a type error fails the image build rather than
+# shipping a bundle that throws in a citizen's browser.
+RUN npm run build
+
+# ---- stage 2: serve ----------------------------------------------------
+FROM nginx:1.27.2-alpine AS runtime
+
+# Config as a template: nginx:alpine's own entrypoint runs envsubst over
+# /etc/nginx/templates/*.template at start, so BACKEND_ORIGIN is resolved per
+# environment, not per build.
+COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
+COPY docker-entrypoint.d/10-config-js.sh /docker-entrypoint.d/10-config-js.sh
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Non-root. nginx:alpine already ships an unprivileged `nginx` user (uid 101),
+# so the work is making the paths it must write to writable by that user and
+# moving the listener off port 80 -- a non-root process cannot bind below 1024.
+RUN chmod +x /docker-entrypoint.d/10-config-js.sh && \
+    sed -i 's|^pid .*|pid /tmp/nginx.pid;|' /etc/nginx/nginx.conf && \
+    sed -i '/^user /d' /etc/nginx/nginx.conf && \
+    mkdir -p /var/cache/nginx /var/run && \
+    chown -R nginx:nginx /var/cache/nginx /var/run /usr/share/nginx/html /etc/nginx/conf.d
+
+ENV BACKEND_ORIGIN="http://backend:8000" \
+    API_BASE="/api" \
+    NGINX_ENTRYPOINT_QUIET_LOGS=1
+
+USER nginx
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
+
+# Exec form, so nginx is PID 1 and receives SIGTERM directly. In shell form
+# the signal would go to /bin/sh and the rolling update would hard-kill it.
+CMD ["nginx", "-g", "daemon off;"]

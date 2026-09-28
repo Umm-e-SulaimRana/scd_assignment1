@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CivicPulse</title>
+    <!--
+      Runtime configuration, not build-time. This file does not exist in the
+      source tree: the container entrypoint writes it from environment
+      variables at start-up (frontend/docker-entrypoint.d/10-config-js.sh).
+      In `vite dev` it 404s harmlessly and src/config.ts falls back to "/api".
+    -->
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
