@@ -76,9 +76,20 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+            # KSV-0014. Postgres can run on an immutable root filesystem, but
+            # only if the two places it writes outside PGDATA are given real
+            # volumes: the unix socket directory and scratch space. Without
+            # these two mounts this flag stops the database from starting at
+            # all, which is why it is three lines rather than one.
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: pgdata
               mountPath: /var/lib/postgresql/data
+            - { name: pg-run, mountPath: /var/run/postgresql }
+            - { name: pg-tmp, mountPath: /tmp }
+      volumes:
+        - { name: pg-run, emptyDir: {} }
+        - { name: pg-tmp, emptyDir: {} }
   volumeClaimTemplates:
     - metadata:
         name: pgdata

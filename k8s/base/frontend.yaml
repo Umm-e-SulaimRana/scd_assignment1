@@ -110,6 +110,8 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+            # Writes only into /html, which is the emptyDir. KSV-0014.
+            readOnlyRootFilesystem: true
 ---
 apiVersion: v1
 kind: Service

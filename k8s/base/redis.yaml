@@ -81,6 +81,11 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+            # Redis writes only to /data, which is the PVC mount, so the root
+            # filesystem can be immutable. Trivy KSV-0014, and it should have
+            # been set here from the start -- the backend and frontend pods
+            # already run this way.
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: redisdata
               mountPath: /data
