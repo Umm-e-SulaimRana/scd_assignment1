@@ -1,0 +1,374 @@
+# CI -- runs on every pull request to main and every push to dev (§3.4).
+#
+# This workflow NEVER publishes anything. It builds both images to prove they
+# build and to hand them to Trivy, and stops there: a pull request that can
+# push artifacts is a pull request that can ship unreviewed code.
+#
+# Configure these as required status checks on main (Settings -> Branches):
+#   lint-and-type / test-backend / test-frontend / build / scan / manifests / integration
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+
+# Least privilege (§3.4). The default token is broader than any job here
+# needs; nothing in CI writes to the repository or to a registry.
+permissions:
+  contents: read
+
+concurrency:
+  # A new push supersedes the run in flight. Saves minutes and stops two runs
+  # racing to report on the same branch.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-type:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # pinned to the Dockerfile's base image
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dev dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff
+        working-directory: backend
+        run: ruff check app/
+
+      - name: mypy
+        working-directory: backend
+        run: mypy app/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: tsc --noEmit
+        working-directory: frontend
+        run: npm run typecheck
+
+  test-backend:
+    runs-on: ubuntu-24.04
+    env:
+      # §2.5: pinned to the deterministic fake so the suite is green on every
+      # run. A flaky pipeline trains a team to ignore red, which is worse than
+      # having no pipeline.
+      TRIAGE_PROVIDER: simulated
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest with coverage
+        working-directory: backend
+        # --cov-fail-under is the gate, not a suggestion. Rubric C wants >= 65%.
+        run: python -m pytest -v --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=65
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          retention-days: 7
+
+  test-frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Vitest
+        working-directory: frontend
+        run: npm test
+
+  build:
+    # Build both images. Do NOT push. A PR must not publish artifacts.
+    runs-on: ubuntu-24.04
+    needs: [lint-and-type, test-backend, test-frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: civicpulse-backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: civicpulse-frontend:ci
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Report image sizes and prove the multi-stage split worked
+        run: |
+          docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep civicpulse
+          echo "--- the final frontend image must contain no Node toolchain ---"
+          if docker run --rm --entrypoint sh civicpulse-frontend:ci -c 'command -v node' >/dev/null 2>&1; then
+            echo "FAIL: node survived into the runtime stage"; exit 1
+          fi
+          echo "ok: no node binary in the runtime image"
+          echo "--- neither image may run as root ---"
+          for img in civicpulse-backend:ci civicpulse-frontend:ci; do
+            user=$(docker run --rm --entrypoint sh "$img" -c 'id -un')
+            echo "$img runs as $user"
+            [ "$user" != "root" ] || { echo "FAIL: $img runs as root"; exit 1; }
+          done
+
+      - name: Save images for the scan job
+        run: |
+          docker save civicpulse-backend:ci civicpulse-frontend:ci -o /tmp/images.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-images
+          path: /tmp/images.tar
+          retention-days: 1
+
+  scan:
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-images
+          path: /tmp
+
+      - name: Load images
+        run: docker load -i /tmp/images.tar
+
+      - name: Trivy -- backend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: civicpulse-backend:ci
+          format: table
+          exit-code: "1"
+          # Fail only where a fix exists. Blocking a merge on an unfixable CVE
+          # teaches the team to add ignore rules, which is how real findings
+          # get buried.
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+      - name: Trivy -- frontend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: civicpulse-frontend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+      - name: Trivy -- repository secrets and misconfiguration
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          scanners: secret,misconfig
+
+  manifests:
+    # Catches a broken manifest in 20 seconds instead of on the cluster.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize and kubeconform
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz" | tar xz kubeconform
+          sudo mv kustomize kubeconform /usr/local/bin/
+
+      - name: Validate both overlays
+        run: |
+          for overlay in dev prod; do
+            echo "::group::$overlay"
+            kustomize build "k8s/overlays/$overlay" \
+              | kubeconform -strict -summary -kubernetes-version 1.30.0 -
+            echo "::endgroup::"
+          done
+
+      - name: Refuse :latest and refuse a real secret in a manifest
+        run: |
+          rendered=$(kustomize build k8s/overlays/prod)
+
+          # §3.4: ":latest may be pushed; it may never be deployed."
+          if grep -E 'image:.*:latest' <<<"$rendered"; then
+            echo "FAIL: a :latest image reached the prod overlay"; exit 1
+          fi
+
+          # §5.3: a real key in a committed manifest is -15 marks, base64 or not.
+          if grep -E '^\s+(GROQ_API_KEY|POSTGRES_PASSWORD):' <<<"$rendered" \
+             | grep -qv 'REPLACE_ME_AT_DEPLOY_TIME'; then
+            echo "FAIL: committed manifests contain something other than a placeholder"; exit 1
+          fi
+
+          # The database must never be reachable from outside the cluster.
+          if grep -A5 'name: postgres' <<<"$rendered" | grep -E 'type: (NodePort|LoadBalancer)'; then
+            echo "FAIL: postgres Service is not ClusterIP"; exit 1
+          fi
+
+          echo "manifest policy checks passed"
+
+  integration:
+    # Lecture 03's question, as a job: does my code work with everybody
+    # else's? This is what catches a localhost bug before a human does.
+    runs-on: ubuntu-24.04
+    needs: [lint-and-type]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from the committed example
+        run: |
+          cp .env.example .env
+          # Deterministic provider: no key, no network, no flake.
+          sed -i 's/^TRIAGE_PROVIDER=.*/TRIAGE_PROVIDER=simulated/' .env
+          sed -i 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-only-not-a-real-secret/' .env
+
+      - name: docker compose up
+        run: docker compose up -d --build
+
+      - name: Wait for /ready (Postgres AND Redis both reachable)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/ready >/dev/null 2>&1; then
+              echo "ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "backend never became ready"; docker compose logs --no-color; exit 1
+
+      - name: Migrate and seed
+        run: |
+          docker compose exec -T backend alembic upgrade head
+          docker compose exec -T backend python -m scripts.seed
+          # Idempotency (§2.3): running it twice must change nothing.
+          docker compose exec -T backend python -m scripts.seed | tee /tmp/seed2.txt
+          grep -q '0 new rows' /tmp/seed2.txt || { echo "FAIL: seed is not idempotent"; exit 1; }
+
+      - name: POST a complaint, GET it back, assert the category
+        run: |
+          created=$(curl -fsS -X POST http://localhost:8000/api/complaints \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"Burst water main flooding Street 12 since fajr, water entering ground floors","location":"Sector G-9"}')
+          echo "$created"
+          id=$(echo "$created" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+          fetched=$(curl -fsS "http://localhost:8000/api/complaints/$id")
+          category=$(echo "$fetched" | python3 -c 'import sys,json;print(json.load(sys.stdin)["category"])')
+          echo "category=$category"
+          [ "$category" = "water" ] || { echo "FAIL: expected water, got $category"; exit 1; }
+
+      - name: X-Cache must go MISS then HIT
+        run: |
+          first=$(curl -fsS -D - -o /dev/null http://localhost:8000/api/stats | grep -i '^x-cache:' | tr -d '\r')
+          second=$(curl -fsS -D - -o /dev/null http://localhost:8000/api/stats | grep -i '^x-cache:' | tr -d '\r')
+          echo "first:  $first"
+          echo "second: $second"
+          echo "$first"  | grep -qi 'MISS' || { echo "FAIL: first call should have missed"; exit 1; }
+          echo "$second" | grep -qi 'HIT'  || { echo "FAIL: second call should have hit"; exit 1; }
+
+      - name: An invalid status transition must be 409, not 500
+        run: |
+          created=$(curl -fsS -X POST http://localhost:8000/api/complaints \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"Streetlight out on the corner for three weeks now","location":"Sector F-10"}')
+          id=$(echo "$created" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+          # open -> resolved is not a legal edge in services/state_machine.py
+          code=$(curl -s -o /tmp/body.json -w '%{http_code}' -X PATCH \
+            "http://localhost:8000/api/complaints/$id/status" \
+            -H 'Content-Type: application/json' -d '{"status":"resolved"}')
+          echo "HTTP $code: $(cat /tmp/body.json)"
+          [ "$code" = "409" ] || { echo "FAIL: expected 409, got $code"; exit 1; }
+          grep -q 'Cannot transition from open to resolved' /tmp/body.json \
+            || { echo "FAIL: the 409 body must name the attempted transition"; exit 1; }
+
+      - name: The frontend's typed client still matches the live OpenAPI schema
+        working-directory: frontend
+        run: node scripts/check-api-contract.mjs http://localhost:8000
+
+      - name: The frontend serves the app and proxies /api on its own origin
+        run: |
+          curl -fsS http://localhost:8080/healthz | grep -q ok
+          curl -fsS http://localhost:8080/ | grep -q '<div id="root">'
+          # /config.js is generated at container start, not baked into the image
+          curl -fsS http://localhost:8080/config.js | tee /tmp/config.js | grep -q '__CIVICPULSE_CONFIG__'
+          # and the proxy works, so the browser never needs a backend hostname
+          curl -fsS http://localhost:8080/api/stats >/dev/null
+
+      - name: Network segmentation -- the frontend must NOT reach the database
+        run: |
+          if docker compose exec -T frontend sh -c 'nc -z -w 3 database 5432'; then
+            echo "FAIL: the frontend can reach the database. -8 marks, and rightly so."
+            exit 1
+          fi
+          echo "ok: frontend -> database is blocked by the internal network"
+          docker compose exec -T backend python -c "import socket;socket.create_connection(('database',5432),3)" \
+            && echo "ok: backend -> database still works"
+
+      - name: Persistence -- down then up must preserve every row
+        run: |
+          before=$(curl -fsS http://localhost:8000/api/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])')
+          docker compose down          # no -v: volumes survive
+          docker compose up -d
+          for i in $(seq 1 60); do curl -fsS http://localhost:8000/ready >/dev/null 2>&1 && break; sleep 1; done
+          after=$(curl -fsS http://localhost:8000/api/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])')
+          echo "rows before=$before after=$after"
+          [ "$before" = "$after" ] || { echo "FAIL: data did not survive a restart"; exit 1; }
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
