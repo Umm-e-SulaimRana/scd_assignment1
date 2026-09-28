@@ -1,32 +1,34 @@
-# secrets — never commit
-.coverage
-htmlcov/
+# Secrets. The single most expensive mistake available in this assignment.
 .env
-*.env
+.env.*
 !.env.example
+*.pem
+*.key
+kubeconfig*
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.egg-info/
+.coverage
+htmlcov/
 
-# Docker
-*.log
-
-# Node / frontend (Eiman's side, added preemptively)
+# Node
 node_modules/
 dist/
-build/
+coverage/
+.tsbuild/
+*.tsbuildinfo
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Editors
+# Editors / OS
 .vscode/
 .idea/
+.DS_Store
+*.swp
+
+# Local evidence scratch (the committed evidence lives in docs/evidence/)
+*.local.log
