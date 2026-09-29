@@ -1,24 +1,3 @@
-"""
-TriageService -- this is where the marks in §2.5 "The engineering around
-the model" actually live. Providers (llm.py, ollama.py, rules.py,
-simulated.py) just make a call and parse a reply. This class is the
-business rule that makes depending on one of them safe:
-
-  1. Content-hash cache lookup in Redis (24h TTL) -- duplicate complaints
-     (a burst main reported by nine neighbours) cost one inference, not nine.
-  2. Hard 10s timeout on the primary provider.
-  3. One retry, with jitter, but ONLY on retryable failures (timeout, 429,
-     5xx) -- never on a 400, because that request was wrong and retrying
-     it wastes the retry budget for no benefit.
-  4. Fallback to RuleBasedTriage on any remaining failure. Recorded as
-     triaged_by = "rules:fallback" and logged as a single WARNING with the
-     provider name and error class (never the raw exception text, which
-     could contain the API key from a stack trace).
-  5. triage_latency_ms is measured end-to-end (including cache lookup,
-     retry sleep, everything) because that's what a citizen actually waits.
-  6. A small in-memory ring buffer of the last 20 outcomes backs
-     GET /api/meta/providers, the observability surface required by §2.2.
-"""
 import asyncio
 import hashlib
 import json
@@ -52,7 +31,6 @@ class TriageService:
         self.fallback_provider = RuleBasedTriage()
         self.recent: deque[TriageOutcome] = deque(maxlen=20)
 
-    # ---- content-hash cache ----
     @staticmethod
     def _content_hash(text: str) -> str:
         normalised = " ".join(text.strip().lower().split())
@@ -75,12 +53,9 @@ class TriageService:
         hits = int(await redis_client.get("triage:cache:hits") or 0)
         return round(hits / total, 4) if total else 0.0
 
-    # ---- retry classification ----
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
-        """timeout, 429 or 5xx -> retryable. Everything else (incl. 400,
-        malformed JSON, schema validation failure) is not -- retrying a
-        request that was wrong the first time just wastes the budget."""
+        # retry only timeouts, 429 and 5xx; never a 400
         status = getattr(exc, "status_code", None)
         if status is None:
             response = getattr(exc, "response", None)
@@ -91,10 +66,10 @@ class TriageService:
 
     async def _call_with_timeout_and_retry(self, text: str, location: str) -> TriageResult:
         last_exc: Exception | None = None
-        for attempt in range(2):  # first try + at most one retry
+        for attempt in range(2):
             try:
                 return await asyncio.wait_for(self.primary.triage(text, location), timeout=10)
-            except Exception as exc:  # noqa: BLE001 -- provider boundary must never crash the request
+            except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if attempt == 0 and self._is_retryable(exc):
                     await asyncio.sleep(random.uniform(0.1, 0.5))  # jitter
@@ -103,9 +78,7 @@ class TriageService:
         assert last_exc is not None
         raise last_exc
 
-    # ---- public API ----
-    async def triage(self, text: str, location: str) -> tuple[TriageResult, str, int]:
-        """Returns (result, triaged_by, latency_ms)."""
+    async def triage(self, text: str, location: str, complaint_id=None) -> tuple[TriageResult, str, int]:
         start = time.monotonic()
         await redis_client.incr("triage:cache:total")
 
@@ -124,7 +97,11 @@ class TriageService:
         except Exception as exc:
             logger.warning(
                 "triage_fallback",
-                extra={"provider": self.primary.name, "error_class": type(exc).__name__},
+                extra={
+                    "complaint_id": str(complaint_id),
+                    "provider": self.primary.name,
+                    "error_class": type(exc).__name__,
+                },
             )
             fallback = True
             provider_name = "rules:fallback"

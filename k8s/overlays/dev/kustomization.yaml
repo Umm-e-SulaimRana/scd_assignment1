@@ -1,0 +1,32 @@
+# Dev overlay: k3d/kind on a laptop.
+#
+# One replica each (a student laptop is not a cluster), the deterministic
+# triage provider so no API key is needed, and locally-built images rather
+# than anything from a registry.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: civicpulse
+
+resources:
+  - ../../base
+
+images:
+  - name: ghcr.io/Umm-e-SulaimRana/scd_assignment1/backend
+    newName: civicpulse-backend
+    newTag: dev
+  - name: ghcr.io/Umm-e-SulaimRana/scd_assignment1/frontend
+    newName: civicpulse-frontend
+    newTag: dev
+
+replicas:
+  - name: backend
+    count: 1
+  - name: frontend
+    count: 1
+
+patches:
+  - path: patch-dev-config.yaml
+  # minReplicas must not exceed the replica count we just set, or the HPA
+  # immediately scales the deployment back up and the override is pointless.
+  - path: patch-hpa-dev.yaml

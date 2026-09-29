@@ -1,0 +1,48 @@
+# §3.3 horizontal scaling.
+#
+# The HPA computes utilisation as usage / request. resources.requests.cpu is
+# set on every container in this repo precisely because of that division --
+# with no request there is no denominator and the HPA reports <unknown>/60%
+# forever. That is the three-line block teams spend an evening debugging.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+  namespace: civicpulse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleDown:
+      # Five minutes of stability before shrinking. Scaling in the instant
+      # load dips means flapping, and every removed pod drops its warm
+      # connection pools; capacity is cheap, thrash is not.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      # No stabilisation window: users are waiting. The measured lag between
+      # load arriving and replicas arriving is in docs/evidence/hpa-scaleout.txt
+      # and answers engineering question #5.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max

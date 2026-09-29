@@ -6,13 +6,11 @@ services/triage_service.py -- that's the four-layer separation from §2.2:
 providers/ = outbound integration, services/ = business rules.
 
 Prompt-injection guardrail: the complaint text is wrapped in <complaint>
-tags and explicitly labelled as untrusted data, and the model is
-constrained to a JSON object whose fields are then re-validated against
-our own Pydantic enum (Category/Priority) on the way back in. Even if the
-model complies with an injected instruction and emits a category that
-isn't one of ours, TriageResult(**data) raises and the request falls back
-to RuleBasedTriage -- the citizen never sees a 500, and the injected
-instruction never reaches the database.
+tags and explicitly labelled as untrusted data, and the model's JSON reply
+is re-validated against our own Pydantic enums (Category/Priority). If the
+model emits a category that isn't one of ours, validation raises and the
+request falls back to RuleBasedTriage -- the citizen never sees a 500, and
+the injected instruction never reaches the database.
 """
 import json
 
@@ -47,23 +45,27 @@ class LLMTriage:
     async def triage(self, text: str, location: str) -> TriageResult:
         user_prompt = f"<complaint>\nTEXT: {text}\nLOCATION: {location}\n</complaint>"
 
+        extra = {}
+        if self.model.startswith("openai/gpt-oss"):
+            # keep the hidden reasoning short so it doesn't eat the token budget
+            extra["reasoning_effort"] = "low"
+
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format={"type": "json_object"},  # Groq JSON mode
+            response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=200,
-            timeout=10,  # belt-and-braces; orchestrator also enforces this
+            max_tokens=1000,
+            timeout=10,
+            extra_body=extra or None,
         )
 
         raw = response.choices[0].message.content
-        data = json.loads(raw)  # bad JSON -> json.JSONDecodeError -> caught upstream, triggers fallback
+        data = json.loads(raw)  # bad JSON -> JSONDecodeError -> fallback upstream
 
-        # Re-validating through our own enums is the guardrail: an
-        # out-of-schema category/priority raises here, not a 500 to the user.
         return TriageResult(
             category=Category(data["category"]),
             priority=Priority(data["priority"]),

@@ -22,11 +22,6 @@ status_enum = postgresql.ENUM("open", "in_progress", "resolved", "rejected", nam
 
 
 def upgrade():
-    bind = op.get_bind()
-    category_enum.create(bind, checkfirst=True)
-    priority_enum.create(bind, checkfirst=True)
-    status_enum.create(bind, checkfirst=True)
-
     op.create_table(
         "complaints",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -49,7 +44,6 @@ def upgrade():
     op.create_index("ix_complaints_status_priority", "complaints", ["status", "priority"])
     # Serves: recency feed / date-range queries (ORDER BY created_at DESC)
     op.create_index("ix_complaints_created_at", "complaints", ["created_at"])
-
 
 def downgrade():
     op.drop_index("ix_complaints_created_at", table_name="complaints")

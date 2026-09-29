@@ -1,0 +1,164 @@
+# CivicPulse -- development stack (§3.2).
+#
+# One command from a clean clone:
+#   cp .env.example .env && docker compose up -d --build
+#
+# This file is the DEV one: it has `build:`, a bind mount for hot reload, and
+# a published backend port so you can curl it directly. compose.prod.yaml is
+# the same topology with none of those three things.
+#
+# The network split is the marked part, so read it before changing anything:
+#   edge     -- frontend <-> backend, and the only network with a route out
+#   internal -- backend <-> database <-> cache, internal: true, no route out
+# frontend joins edge only. database and cache join internal only. backend is
+# the single service on both, and is therefore the only thing that can reach
+# the data. `docker compose exec frontend ping database` MUST fail; that
+# failing command is the evidence (scripts/prove-isolation.sh).
+
+name: civicpulse
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true   # no route to the outside world
+
+volumes:
+  pgdata:          # PostgreSQL data directory -- the durable one. Losing it loses every complaint.
+  redisdata:       # Redis AOF. Justified in docs/ENGINEERING-NOTES.md: the rate-limiter counters
+                   # are not "just a cache" -- dropping them on restart resets everyone's quota
+                   # to zero, which is exactly the moment an abusive client would retry.
+  ollama_models:   # ~800 MB of model weights. Without this, every `up` re-pulls them.
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: civicpulse-frontend:dev
+    networks: [edge]          # deliberately NOT on internal
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Runtime config, read by nginx envsubst and by the entrypoint that
+      # writes /config.js. No API URL is compiled into the bundle.
+      BACKEND_ORIGIN: http://backend:8000
+      API_BASE: /api
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 128M }
+        reservations: { cpus: "0.05", memory: 32M }
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: civicpulse-backend:dev
+    networks: [edge, internal]   # the only service bridging both -- see ADR 0003
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+      REDIS_URL: redis://cache:6379/0
+      TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-rules}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Same-origin through the nginx proxy, so the browser never sends a
+      # cross-origin request and this can stay closed.
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"   # dev convenience: curl and /docs. Absent from prod.
+    volumes:
+      # Dev-only. Right here because editing a route and seeing it live is the
+      # point of a dev stack; wrong in compose.prod.yaml because it replaces
+      # the image's audited code with whatever happens to be on the host disk,
+      # which makes the running system unreproducible and undeployable.
+      - ./backend/app:/app/app:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 512M }
+        reservations: { cpus: "0.10", memory: 128M }
+
+  database:
+    image: postgres:16.4-alpine
+    networks: [internal]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Not `pg_isready` alone: that answers before the init scripts finish on
+      # a first boot, and the backend then connects to a database with no
+      # role yet. Querying as the real user is the honest check.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 512M }
+        reservations: { cpus: "0.10", memory: 128M }
+
+  cache:
+    image: redis:7.4.1-alpine
+    networks: [internal]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+        reservations: { cpus: "0.05", memory: 64M }
+
+  ollama:
+    image: ollama/ollama:0.3.12
+    networks: [edge]        # needs a route out to pull weights; see ADR 0003
+    volumes:
+      - ollama_models:/root/.ollama
+    profiles: ["ollama"]    # opt-in: docker compose --profile ollama up -d
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "2.00", memory: 4G }
+        reservations: { cpus: "0.25", memory: 512M }

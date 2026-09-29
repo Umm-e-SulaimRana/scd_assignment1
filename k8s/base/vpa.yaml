@@ -1,0 +1,39 @@
+# Vertical Pod Autoscaler in RECOMMENDER MODE (§3.3). updateMode: "Off" means
+# it observes and advises; it never evicts a pod to resize it.
+#
+# Why Off and not Auto, which is engineering question #6:
+#
+#   The HPA scales on CPU utilisation = usage / request. VPA in Auto mode
+#   changes `request`. Put them on the same signal and they fight:
+#
+#     VPA raises the CPU request
+#       -> computed utilisation falls (same usage, bigger denominator)
+#         -> HPA sees headroom and scales IN
+#           -> the surviving pods absorb more load each
+#             -> VPA observes higher usage and raises the request again
+#
+#   The loop is stable in neither direction and the cluster oscillates.
+#   Recommender mode plus a human reading the numbers and editing the
+#   manifest is the current industrial practice for exactly this reason.
+#
+# Requires the VPA CRDs (hack/vpa-up.sh from the autoscaler repo). It is
+# excluded from the CI kustomize build via overlays/prod, because kubeconform
+# cannot validate a CRD it has no schema for.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: backend-vpa
+  namespace: civicpulse
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  updatePolicy:
+    updateMode: "Off"   # recommend only -- do not evict
+  resourcePolicy:
+    containerPolicies:
+      - containerName: backend
+        minAllowed: { cpu: 50m, memory: 128Mi }
+        maxAllowed: { cpu: 2000m, memory: 1Gi }
+        controlledResources: ["cpu", "memory"]

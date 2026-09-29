@@ -1,0 +1,117 @@
+# StatefulSet, not Deployment (§3.3). A Deployment for a database is a marked
+# error, and the reason is worth saying precisely at the viva:
+#
+#   - A Deployment's pods are interchangeable and get random names. A
+#     StatefulSet's are ordinal and stable: postgres-0 is always postgres-0.
+#   - volumeClaimTemplates gives each ordinal its OWN PersistentVolumeClaim,
+#     bound for the life of the StatefulSet. A Deployment sharing one PVC
+#     across replicas would have two postgres processes writing the same data
+#     directory, which corrupts it.
+#   - Scaling and rolling updates happen one ordinal at a time, in order,
+#     which is the only safe way to touch stateful storage.
+#
+# Persistence contract: `kubectl delete pod postgres-0` must preserve every
+# row. The pod is recreated and re-binds the same PVC -- that is the demo.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: civicpulse
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # `postgres` in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: postgres:16.4-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER } }
+            - name: POSTGRES_DB
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD } }
+            - name: PGDATA
+              # A subdirectory, not the mount root: the volume root can carry
+              # a lost+found entry that makes initdb refuse to start.
+              value: /var/lib/postgresql/data/pgdata
+          startupProbe:
+            # initdb on a fresh volume takes a while. 60 x 2s of grace before
+            # liveness is allowed to have an opinion.
+            exec: { command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -q"] }
+            failureThreshold: 60
+            periodSeconds: 2
+          livenessProbe:
+            exec: { command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -q"] }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec: { command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB -q"] }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 1000m, memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            # KSV-0014. Postgres can run on an immutable root filesystem, but
+            # only if the two places it writes outside PGDATA are given real
+            # volumes: the unix socket directory and scratch space. Without
+            # these two mounts this flag stops the database from starting at
+            # all, which is why it is three lines rather than one.
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - { name: pg-run, mountPath: /var/run/postgresql }
+            - { name: pg-tmp, mountPath: /tmp }
+      volumes:
+        - { name: pg-run, emptyDir: {} }
+        - { name: pg-tmp, emptyDir: {} }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: civicpulse
+spec:
+  # ClusterIP, never NodePort or LoadBalancer. Exposing a database outside the
+  # cluster is -8 marks and, in the real world, how databases end up on Shodan.
+  type: ClusterIP
+  clusterIP: None            # headless: gives postgres-0 a stable DNS name
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
