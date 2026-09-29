@@ -1,0 +1,15 @@
+k6 load test - CivicPulse on k3d
+source: scripts/load-test.js, 5 -> 60 VUs
+raw per-request CSV was 100 MB and is gitignored; this is derived from it
+
+http_reqs          59835
+http_req_failed    0 (0.00%)
+
+http_req_duration (ms)
+  p50       8.81
+  p90      33.61
+  p95      42.40
+  p99     120.26
+  min       0.65
+  max     486.04
+  avg      15.50
