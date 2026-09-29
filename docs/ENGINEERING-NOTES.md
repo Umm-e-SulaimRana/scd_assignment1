@@ -5,7 +5,6 @@ Eiman Wasim (24I-3081) · Umme Sulaim (24I-3062)
 Answers 1, 2, 3, 5, 6, 7 are Eiman's; 4 is Sulaim's; 8 is both.
 
 ---
-
 ## 1. Name three things that differ between your laptop and the CI runner, and the exact line that freezes each
 
 **Python version.** The laptop this was developed on runs Python 3.14. CI runs
@@ -113,11 +112,40 @@ fallback for that reason. See ADR 0002 and ADR 0003.
 
 ## 4. What does "correct" mean for a probabilistic component, and how do you keep CI deterministic?
 
-*(Sulaim — this one is about the TriageProvider interface and the test strategy
-behind it. Worth referencing `backend/app/providers/triage/base.py`, the four
-implementations, and the fact that `test-backend` pins
-`TRIAGE_PROVIDER=simulated` while the `integration` job pins
-`TRIAGE_PROVIDER=rules`, and why those two choices are different.)*
+`backend/app/providers/triage/base.py` defines TriageProvider as a Protocol with
+one method, `triage(text, location) -> TriageResult`. Four implementations
+satisfy it: LLMTriage (Groq), OllamaTriage, RuleBasedTriage, and SimulatedTriage.
+With a real LLM behind that interface, the same complaint text can classify
+differently across runs — the model is not guaranteed to be consistent, and
+should not be expected to be.
+
+So "correct" here cannot mean "identical output every time." It means: the
+output always satisfies the TriageResult schema (a real Category, a real
+Priority, a summary ≤140 chars, a confidence in [0,1]) — enforced by Pydantic
+validation regardless of which provider answered — and the system's behaviour
+around a slow or wrong answer is deterministic even when the answer itself is
+not. That determinism lives in `backend/app/services/triage_service.py`: a hard
+10s timeout, one jittered retry only on timeout/429/5xx, and a fallback to
+RuleBasedTriage on anything else, recorded as `triaged_by = "rules:fallback"`.
+
+This is why CI never runs the unit-test job and the integration job against the
+same provider:
+
+- `test-backend` sets `TRIAGE_PROVIDER: simulated` directly as a job environment
+  variable (`.github/workflows/ci.yml:76`) — a deterministic fake with no
+  network call and configurable failure injection, built specifically to test
+  the fallback path itself (`test_fallback_logging.py` asserts that a provider
+  which always raises still returns 201 with `triaged_by == "rules:fallback"`).
+- `integration` runs the real Compose stack, and before starting it, rewrites
+  `.env` in place with `sed -i 's/^TRIAGE_PROVIDER=.*/TRIAGE_PROVIDER=rules/'
+  .env` (`ci.yml:280`, with the reasoning noted in a comment on `ci.yml:279`).
+  This job exercises a genuine implementation of the interface end-to-end
+  rather than a test double, while staying network-free and reproducible —
+  RuleBasedTriage is the only implementation that's both "real" (no mocking)
+  and deterministic.
+
+Neither job ever runs against the actual LLM, so a flaky third-party API can
+never turn a green pipeline red.
 
 ---
 
@@ -269,4 +297,47 @@ pushing turned a three-minute round trip per attempt into a thirty-second one,
 and it immediately surfaced two further findings CI had never even reached,
 because the backend step was failing first and ending the job.
 
-*(Sulaim — add yours.)*
+**Sulaim.** Switching `TRIAGE_PROVIDER` to `ollama` in `.env` had no effect —
+`docker compose exec backend printenv TRIAGE_PROVIDER` kept printing `llm` no
+matter how many times the backend was recreated. The first wrong belief was that
+the edit was landing in the wrong `.env` file (this had happened before, with
+`GROQ_MODEL`) — but checking both the root and `backend/.env` confirmed only one
+existed and it correctly said `ollama`.
+
+The command that actually told the truth was
+`docker compose -f docker-compose.dev.yml config | findstr TRIAGE_PROVIDER`,
+which showed Compose resolving the value to `llm` even though the `.env` file on
+disk said otherwise. That meant something was overriding the file outright — and
+`echo %TRIAGE_PROVIDER%` in a **brand-new terminal window** (not just a new `cd`)
+still printed a value, which ruled out a stray `set` command from earlier in the
+session. It was a persistent Windows environment variable, set at some earlier
+point (likely via `setx` while troubleshooting something unrelated), silently
+taking priority over `.env` on every single command.
+
+The lesson: `.env` is not the only source of truth for an environment variable
+on Windows — a session or OS-level variable always wins over a Compose `.env`
+file, and it survives closing the terminal. `docker compose config` is the
+fastest way to see what Compose actually resolved before assuming the file
+itself is wrong.
+
+## Data and cache layer notes (Sulaim — §2.3 and §2.4 requirements)
+
+**Index justification.** `backend/alembic/versions/0001_initial.py:44` creates
+`ix_complaints_status_priority` on `(status, priority)`, serving the dashboard's
+default filtered view (§2.2: filter by category/priority/status). `:46` creates
+`ix_complaints_created_at`, serving the recency feed / default sort order (newest
+complaints first) and demo/seed-data browsing.
+
+**Redis AOF volume justification.** Redis backs two different jobs here: the
+stats cache (rebuildable, TTL 30s, no persistence needed) and the distributed
+rate limiter's counters. The rate limiter state is what actually benefits from
+surviving a Redis restart — without it, a restart during a burst of traffic
+would silently reset every client's rate-limit window, letting a client that was
+about to be blocked start fresh. AOF on a named volume protects that, even
+though the cached stats data itself is fine to lose and rebuild.
+
+**Measured triage cache hit rate.** Content-hash triage cache, 24h TTL:
+measured hit rate of 0.70 (10 requests, 3 distinct complaint texts, Redis
+flushed before the run). Cache hits returned in ~0ms; misses took ~0.7–1.1s
+(Groq) or ~6.6s (Ollama, CPU inference — see `docs/TRIAGE.md` for the full
+provider comparison).
