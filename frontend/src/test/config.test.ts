@@ -13,7 +13,10 @@ afterEach(() => {
 
 describe('runtime configuration', () => {
   it('falls back to the same-origin /api path when nothing is injected', () => {
-    expect(loadConfig().apiBase).toBe('/api')
+    // DELIBERATELY WRONG. This asserts a value config.ts does not and should
+    // not produce, to demonstrate that a red pipeline blocks a merge into a
+    // protected branch. Reverted in the next commit on this branch.
+    expect(loadConfig().apiBase).toBe('/backend-api')
   })
 
   it('uses whatever /config.js injected at container start', () => {
