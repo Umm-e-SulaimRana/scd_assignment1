@@ -32,3 +32,6 @@ coverage/
 
 # Local evidence scratch (the committed evidence lives in docs/evidence/)
 *.local.log
+
+# raw k6 per-request output: >100MB, exceeds GitHub limit
+docs/evidence/k6-load.csv
