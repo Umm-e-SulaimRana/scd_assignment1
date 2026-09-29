@@ -5,7 +5,6 @@ Eiman Wasim (24I-3081) · Umme Sulaim (24I-3062)
 Answers 1, 2, 3, 5, 6, 7 are Eiman's; 4 is Sulaim's; 8 is both.
 
 ---
-
 ## 1. Name three things that differ between your laptop and the CI runner, and the exact line that freezes each
 
 **Python version.** The laptop this was developed on runs Python 3.14. CI runs
@@ -152,11 +151,42 @@ never turn a green pipeline red.
 
 ## 5. What is the HPA's scale-out lag, in seconds, measured on your own run?
 
-*(Pending the k3d run. Fill from `docs/evidence/hpa-watch.txt` and
-`hpa-series.csv`. The number is made up of four components and the answer should
-name all four: metrics-server's scrape interval, the HPA controller's sync
-period, image pull time on the node, and the startup probe passing. Do not quote
-a single figure without saying which of those dominated.)*
+Measured on k3d (k3s v1.35.5) with the built-in metrics-server, backend at
+`requests.cpu: 100m`, HPA target 60%, min 1 max 3. Raw data in
+`docs/evidence/hpa-watch.txt` and `docs/evidence/hpa-series.csv`; the load is
+`scripts/load-test.js` stepping from 5 to 60 virtual users.
+
+| elapsed | event |
+|---|---|
+| ~60s | load arrives, utilisation 5% -> 45% |
+| 78s | 64%, first sample above the 60% target |
+| 109s | HPA raises desiredReplicas 1 -> 2 |
+| 114s | second pod Ready |
+| 140s | desiredReplicas -> 3 |
+| 145s | third pod Ready |
+
+**31 seconds from the metric crossing the target to the HPA acting, and 36
+seconds to real added capacity.**
+
+The decision is almost all of it. Of that 31s, roughly 15s is metrics-server's
+scrape interval and roughly 15s is the HPA controller's sync period, and those
+two are serial: the controller can only act on a value that has already been
+published. Pod startup contributed 5s -- the container was Ready almost
+immediately, because the startup probe passed on its first attempt.
+
+The fourth component, image pull, was **zero here and would not be in
+production**. The images were side-loaded onto the node with `k3d image import`
+before the run, so the kubelet had them locally. Pulling
+`ghcr.io/OWNER/REPO/backend:<sha>` on a cold node would add however long that
+takes to every one of these numbers, and it is the component most likely to
+dominate on a real cluster.
+
+One result worth not glossing over: at 3 replicas utilisation stayed at
+116-122%, well above target, for the whole hold. The HPA was not satisfied, it
+was **capped** -- `maxReplicas: 3` in the dev overlay stopped it going further.
+The autoscaler behaved correctly; the ceiling was wrong for that load. A number
+that says "it scaled out in 36 seconds" without saying it then ran pinned at
+its limit would be describing only the half of the run that looks good.
 
 ---
 

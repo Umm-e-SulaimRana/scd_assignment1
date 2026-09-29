@@ -90,7 +90,11 @@ spec:
             - { name: nginx-run, mountPath: /var/run }
             - { name: nginx-conf, mountPath: /etc/nginx/conf.d }
             - { name: html, mountPath: /usr/share/nginx/html }
+            # nginx.conf points its pid file at /tmp/nginx.pid, so /tmp has to be
+            # writable too or nginx exits immediately on a read-only root.
+            - { name: tmp, mountPath: /tmp }
       volumes:
+        - { name: tmp, emptyDir: {} }
         - { name: nginx-cache, emptyDir: {} }
         - { name: nginx-run, emptyDir: {} }
         - { name: nginx-conf, emptyDir: {} }

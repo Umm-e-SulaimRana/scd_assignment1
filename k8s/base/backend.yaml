@@ -51,18 +51,24 @@ spec:
             - name: http
               containerPort: 8000
           env:
-            - name: DATABASE_URL
-              # Assembled from the ConfigMap and the Secret rather than stored
-              # whole, so the password is never in a ConfigMap and the host is
-              # never in a Secret.
-              value: >-
-                postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres.civicpulse.svc.cluster.local:5432/$(POSTGRES_DB)
+            # Order matters. Kubernetes expands $(VAR) only against variables
+            # declared EARLIER in this list, so the three parts must be
+            # declared before DATABASE_URL uses them. Declared after, they do
+            # not expand and the container receives the literal string.
+            # Compose has no such rule, which is why this only appeared on a
+            # cluster: /ready returned 503 while docker compose was fine.
             - name: POSTGRES_USER
               valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER } }
             - name: POSTGRES_DB
               valueFrom: { configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB } }
             - name: POSTGRES_PASSWORD
               valueFrom: { secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD } }
+            - name: DATABASE_URL
+              # Assembled from the ConfigMap and the Secret rather than stored
+              # whole, so the password is never in a ConfigMap and the host is
+              # never in a Secret.
+              value: >-
+                postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres.civicpulse.svc.cluster.local:5432/$(POSTGRES_DB)
             - name: GROQ_API_KEY
               valueFrom: { secretKeyRef: { name: civicpulse-secrets, key: GROQ_API_KEY } }
           envFrom:
